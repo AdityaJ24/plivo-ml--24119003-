@@ -5,6 +5,9 @@ Runs as:
 
 Outputs CSV with columns: turn_id,pause_index,p_eot
 Enforces strict causality constraint (only audio up to pause_start used).
+
+LIBRARY COMPLIANCE: numpy, scipy, scikit-learn, joblib only.
+No LightGBM, CatBoost, or pretrained models.
 """
 import argparse
 import csv
@@ -50,45 +53,47 @@ def predict_folder(data_dir, out_csv, model_path="eot_model.joblib"):
     """Load model artifact, extract features strictly before pause_start, write predictions."""
     resolved_model_path = find_model_file(model_path)
     payload = joblib.load(resolved_model_path)
-    
+
     # Handle dict payload vs raw estimator model
     if isinstance(payload, dict):
         model = payload["model"]
     else:
         model = payload
-    
+
     labels_csv = os.path.join(data_dir, "labels.csv")
     if not os.path.exists(labels_csv):
         raise FileNotFoundError(f"labels.csv not found in {data_dir}")
-        
+
     rows = list(csv.DictReader(open(labels_csv)))
     cache = {}
-    
+
     X = []
     keys = []
     for r in rows:
         audio_rel_path = os.path.normpath(r["audio_file"])
         audio_path = os.path.normpath(os.path.join(data_dir, audio_rel_path))
-        
+
         if audio_path not in cache:
             cache[audio_path] = load_wav(audio_path)
         x, sr = cache[audio_path]
-        
+
         pause_start = float(r["pause_start"])
         pause_index = int(r["pause_index"])
-        
+
         feats = extract_advanced_features(x, sr, pause_start=pause_start, pause_index=pause_index)
         X.append(feats)
         keys.append((r["turn_id"], pause_index))
-        
+
     X_arr = np.array(X, dtype=np.float32)
-    
+    # NaN/Inf safety
+    X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
+
     if hasattr(model, "predict_proba"):
         probs = model.predict_proba(X_arr)[:, 1]
     else:
         probs = model.decision_function(X_arr)
         probs = 1.0 / (1.0 + np.exp(-probs))
-        
+
     # Ensure directory of out_csv exists
     out_dir = os.path.dirname(out_csv)
     if out_dir and not os.path.exists(out_dir):
@@ -99,7 +104,7 @@ def predict_folder(data_dir, out_csv, model_path="eot_model.joblib"):
         w.writerow(["turn_id", "pause_index", "p_eot"])
         for (tid, pi), p in zip(keys, probs):
             w.writerow([tid, pi, f"{p:.4f}"])
-            
+
     print(f"Successfully wrote {len(keys)} predictions to {out_csv}")
 
 
@@ -109,7 +114,7 @@ def main():
     ap.add_argument("--out", default="predictions.csv", help="Output path for predictions CSV")
     ap.add_argument("--model", default="eot_model.joblib", help="Path to saved model artifact")
     args = ap.parse_args()
-    
+
     predict_folder(args.data_dir, args.out, model_path=args.model)
 
 
