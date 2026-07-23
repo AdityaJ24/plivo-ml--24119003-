@@ -1,8 +1,9 @@
-"""Model Training & Evaluation Script for End-of-Turn (EoT) Detection.
+"""Regularized Model Training & Evaluation Script for End-of-Turn (EoT) Detection.
 
-Features extracted via features_advanced.py (strictly causality compliant).
+Features extracted via features_advanced.py (strictly causality compliant, 42 features, <=3400Hz telephony bounded).
 Uses ONLY scikit-learn classifiers (no LightGBM, CatBoost, or external libraries).
 Evaluates with GroupKFold cross-validation (grouped by turn_id).
+Includes probability calibration (CalibratedClassifierCV) to hit exact 5% false-cutoff budget.
 Saves trained model to `eot_model.joblib`.
 
 LIBRARY COMPLIANCE: numpy, scipy, scikit-learn, joblib only.
@@ -12,18 +13,10 @@ import csv
 import os
 import joblib
 import numpy as np
-from sklearn.ensemble import (
-    ExtraTreesClassifier,
-    GradientBoostingClassifier,
-    RandomForestClassifier,
-    VotingClassifier,
-    HistGradientBoostingClassifier,
-)
-from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import GroupKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
+from sklearn.base import clone
 
 from features_advanced import load_wav, extract_advanced_features
 from score import evaluate, score
@@ -57,43 +50,28 @@ def load_dataset(data_dir):
 
 
 def get_models():
-    """Return dictionary of candidate models/pipelines — ALL scikit-learn only."""
+    """Return dictionary of regularized candidate models — scikit-learn only."""
     models = {}
 
-    # 1. Scaled Logistic Regression
-    models["LogisticRegression"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=2000, class_weight="balanced", C=0.5, random_state=42))
-    ])
-
-    # 2. Multi-Layer Perceptron Neural Net (sklearn)
-    models["MLPClassifier"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=800, alpha=0.01, random_state=42))
-    ])
-
-    # 3. Random Forest
-    models["RandomForest"] = RandomForestClassifier(
-        n_estimators=400, max_depth=8, min_samples_leaf=2,
-        class_weight="balanced", random_state=42, n_jobs=-1
+    # Primary Model: Regularized GradientBoostingClassifier (shallow max_depth=3, min_samples_leaf=8, subsample=0.85)
+    models["GradientBoosting_Reg"] = GradientBoostingClassifier(
+        n_estimators=160, max_depth=3, learning_rate=0.03,
+        subsample=0.85, min_samples_leaf=8, random_state=42
     )
 
-    # 4. Extra Trees (tuned)
-    models["ExtraTrees"] = ExtraTreesClassifier(
-        n_estimators=400, max_depth=10, min_samples_leaf=2,
-        class_weight="balanced", random_state=42, n_jobs=-1
+    # Calibrated GradientBoosting (Platt sigmoid calibration)
+    models["Calibrated_GB"] = CalibratedClassifierCV(
+        estimator=GradientBoostingClassifier(
+            n_estimators=160, max_depth=3, learning_rate=0.03,
+            subsample=0.85, min_samples_leaf=8, random_state=42
+        ),
+        method="sigmoid", cv=3
     )
 
-    # 5. Gradient Boosting (sklearn)
-    models["GradientBoosting"] = GradientBoostingClassifier(
-        n_estimators=250, max_depth=4, learning_rate=0.04,
-        subsample=0.85, min_samples_leaf=4, random_state=42
-    )
-
-    # 6. Histogram Gradient Boosting (sklearn)
-    models["HistGradientBoosting"] = HistGradientBoostingClassifier(
-        max_iter=300, max_depth=5, learning_rate=0.04,
-        min_samples_leaf=4, l2_regularization=0.1, random_state=42
+    # Regularized HistGradientBoostingClassifier
+    models["HistGradientBoosting_Reg"] = HistGradientBoostingClassifier(
+        max_iter=150, max_depth=3, learning_rate=0.03,
+        min_samples_leaf=10, l2_regularization=1.0, random_state=42
     )
 
     return models
@@ -101,7 +79,6 @@ def get_models():
 
 def evaluate_cv(X, y, groups, model_name, model, n_splits=5):
     """Run GroupKFold cross-validation and compute out-of-fold predictions."""
-    from sklearn.base import clone
     gkf = GroupKFold(n_splits=n_splits)
     oof_preds = np.zeros(len(y), dtype=np.float64)
 
@@ -130,9 +107,9 @@ def main():
     ap.add_argument("--out_model", default="d:/Plivo/eot_model.joblib")
     args = ap.parse_args()
 
-    print("=" * 70)
-    print("EoT Model Training Iteration — 78 Features (scikit-learn ONLY)")
-    print("=" * 70)
+    print("=" * 75)
+    print("EoT Regularized Training — 42 Streamlined Features (Telephony Bounded)")
+    print("=" * 75)
 
     print("\nLoading and extracting features for English dataset...")
     X_en, y_en, g_en, k_en = load_dataset(args.en_dir)
@@ -153,18 +130,22 @@ def main():
     X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
 
     candidate_models = get_models()
-    oof_results = {}
+    best_overall_score = float("inf")
+    best_model_name = None
+    best_model_obj = None
+
+    print(f"{'Model Name':28s} | {'EN OOF Delay':12s} {'EN AUC':8s} {'EN Cut':7s} | {'HI OOF Delay':12s} {'HI AUC':8s} {'HI Cut':7s} | {'In-Sample AUC':13s}")
+    print("-" * 108)
 
     for name, clf in candidate_models.items():
-        print(f"[CV] Training {name}...")
         oof_p = evaluate_cv(X_all, y_all, g_all, name, clf)
-        oof_results[name] = oof_p
 
         p_en = oof_p[:len(y_en)]
         p_hi = oof_p[len(y_en):]
 
         temp_pred_file = f"_temp_oof_{name}.csv"
 
+        # EN OOF
         with open(temp_pred_file, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["turn_id", "pause_index", "p_eot"])
@@ -172,6 +153,7 @@ def main():
                 w.writerow([tid, pi, f"{val:.4f}"])
         r_en = score(os.path.join(args.en_dir, "labels.csv"), temp_pred_file)
 
+        # HI OOF
         with open(temp_pred_file, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["turn_id", "pause_index", "p_eot"])
@@ -182,63 +164,31 @@ def main():
         if os.path.exists(temp_pred_file):
             os.remove(temp_pred_file)
 
-        print(f"  [{name:22s}]  EN: delay={r_en['latency']*1000:4.0f}ms (AUC={r_en['auc']:.3f}, cut={r_en['cutoff']*100:.1f}%) | "
-              f"HI: delay={r_hi['latency']*1000:4.0f}ms (AUC={r_hi['auc']:.3f}, cut={r_hi['cutoff']*100:.1f}%)")
+        # Measure In-Sample AUC to check generalization gap
+        m_full = clone(clf)
+        m_full.fit(X_all, y_all)
+        p_in = m_full.predict_proba(X_all)[:, 1] if hasattr(m_full, "predict_proba") else m_full.decision_function(X_all)
+        from sklearn.metrics import roc_auc_score
+        in_sample_auc = roc_auc_score(y_all, p_in)
 
-    # Weighted ensemble from OOF predictions
-    print("\n--- Weighted Ensemble (OOF) ---")
-    weights = {
-        "HistGradientBoosting": 0.28,
-        "ExtraTrees": 0.28,
-        "GradientBoosting": 0.24,
-        "MLPClassifier": 0.10,
-        "LogisticRegression": 0.05,
-        "RandomForest": 0.05,
-    }
-    oof_ens = np.zeros(len(y_all), dtype=np.float64)
-    for m_name, w in weights.items():
-        oof_ens += w * oof_results[m_name]
+        # Priority metric: Hindi OOF delay + English OOF delay
+        combined_delay = r_en['latency'] * 1000 + r_hi['latency'] * 1000
 
-    p_en_ens = oof_ens[:len(y_en)]
-    p_hi_ens = oof_ens[len(y_en):]
+        print(f"{name:28s} | {r_en['latency']*1000:6.0f} ms     {r_en['auc']:6.3f}   {r_en['cutoff']*100:4.1f}%   | "
+              f"{r_hi['latency']*1000:6.0f} ms     {r_hi['auc']:6.3f}   {r_hi['cutoff']*100:4.1f}%   | {in_sample_auc:13.3f}")
 
-    with open("_temp_ens.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["turn_id", "pause_index", "p_eot"])
-        for (tid, pi), val in zip(k_en, p_en_ens):
-            w.writerow([tid, pi, f"{val:.4f}"])
-    r_en_ens = score(os.path.join(args.en_dir, "labels.csv"), "_temp_ens.csv")
+        if combined_delay < best_overall_score or best_model_obj is None:
+            best_overall_score = combined_delay
+            best_model_name = name
+            best_model_obj = m_full
 
-    with open("_temp_ens.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["turn_id", "pause_index", "p_eot"])
-        for (tid, pi), val in zip(k_hi, p_hi_ens):
-            w.writerow([tid, pi, f"{val:.4f}"])
-    r_hi_ens = score(os.path.join(args.hi_dir, "labels.csv"), "_temp_ens.csv")
-    if os.path.exists("_temp_ens.csv"):
-        os.remove("_temp_ens.csv")
+    print("\n" + "=" * 75)
+    print(f"Selected Primary Model: {best_model_name}")
+    print("=" * 75)
 
-    print(f"  [{'WeightedEnsemble':22s}]  EN: delay={r_en_ens['latency']*1000:4.0f}ms (AUC={r_en_ens['auc']:.3f}, cut={r_en_ens['cutoff']*100:.1f}%) | "
-          f"HI: delay={r_hi_ens['latency']*1000:4.0f}ms (AUC={r_hi_ens['auc']:.3f}, cut={r_hi_ens['cutoff']*100:.1f}%)")
-
-    # Fit final VotingClassifier on full dataset
-    print("\nFitting final Voting Ensemble on complete dataset (sklearn only)...")
-    from sklearn.base import clone
-
-    final_estimators = []
-    for name, base_clf in candidate_models.items():
-        final_estimators.append((name.lower(), clone(base_clf)))
-
-    final_ensemble = VotingClassifier(
-        estimators=final_estimators,
-        voting="soft",
-        weights=[weights.get(name, 0.1) for name in candidate_models.keys()]
-    )
-    final_ensemble.fit(X_all, y_all)
-
-    # Save to both target locations
+    # Save final model payload
     model_payload = {
-        "model": final_ensemble,
+        "model": best_model_obj,
         "n_features": X_all.shape[1],
         "feature_names": [f"f_{i}" for i in range(X_all.shape[1])],
         "sklearn_only": True,
@@ -249,7 +199,7 @@ def main():
     if os.path.exists("d:/Plivo/eot_handout"):
         joblib.dump(model_payload, "d:/Plivo/eot_handout/eot_model.joblib", compress=3)
 
-    print(f"\nSuccessfully saved final model artifact to {args.out_model}")
+    print(f"Successfully saved regularized model artifact to {args.out_model}\n")
 
 
 if __name__ == "__main__":
