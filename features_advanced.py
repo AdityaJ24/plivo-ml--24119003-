@@ -93,7 +93,7 @@ def compute_f0_contour(fr, sr):
 def compute_mfcc_simple(fr, sr, n_mfcc=13, n_mels=26):
     """Compute simple MFCCs using numpy/scipy FFT for full dependency independence."""
     if len(fr) == 0:
-        return np.zeros(n_mfcc, dtype=np.float32)
+        return np.zeros((0, n_mfcc), dtype=np.float32)
 
     fl = fr.shape[1]
     window = np.hamming(fl)
@@ -215,11 +215,10 @@ def find_voiced_segments(f0_contour_arr):
 
 
 def compute_final_syllable_lengthening(f0_contour_arr, hop_ms=10):
-    """Ratio of last voiced segment duration to average voiced segment duration.
-    Final syllable lengthening is a strong cue for turn completion."""
+    """Ratio of last voiced segment duration to average voiced segment duration."""
     segments = find_voiced_segments(f0_contour_arr)
     if len(segments) < 2:
-        return 1.0  # can't compare
+        return 1.0
     lengths = [s[1] for s in segments]
     last_len = lengths[-1]
     avg_len = np.mean(lengths[:-1])
@@ -240,44 +239,83 @@ def compute_speech_rate(f0_contour_arr, hop_ms=10):
     return float(transitions / duration_s)
 
 
-# Total features: 62
-N_FEATURES = 62
+def compute_unvoiced_gaps(f0_contour_arr, hop_ms=10, min_gap_ms=50):
+    """Count unvoiced gaps longer than min_gap_ms inside voiced speech."""
+    min_gap_frames = int(min_gap_ms / hop_ms)
+    voiced = (f0_contour_arr > 0).astype(np.int32)
+    gaps = 0
+    curr = 0
+    # count unvoiced frames between voiced frames
+    first_v = np.where(voiced == 1)[0]
+    if len(first_v) < 2:
+        return 0
+    start_idx, end_idx = first_v[0], first_v[-1]
+    for val in voiced[start_idx:end_idx + 1]:
+        if val == 0:
+            curr += 1
+        else:
+            if curr >= min_gap_frames:
+                gaps += 1
+            curr = 0
+    return gaps
+
+
+# Total features: 78
+N_FEATURES = 78
 
 
 def extract_advanced_features(x, sr, pause_start, pause_index=0):
     """Extract a rich, causality-compliant feature vector strictly using x[0 : pause_start].
 
-    Returns a feature vector of length N_FEATURES (62).
+    Returns a feature vector of length N_FEATURES (78).
     """
     # Audio strictly before pause_start
     audio_full = x[:int(pause_start * sr)]
     if len(audio_full) < int(sr * 0.05):  # less than 50ms of audio
         return np.zeros(N_FEATURES, dtype=np.float32)
 
-    # Extract trailing windows at multiple resolutions
+    # Trailing windows at multiple resolutions
+    win_015 = get_speech_before(x, sr, pause_start, max_window_s=0.15)
     win_03 = get_speech_before(x, sr, pause_start, max_window_s=0.3)
     win_075 = get_speech_before(x, sr, pause_start, max_window_s=0.75)
     win_15 = get_speech_before(x, sr, pause_start, max_window_s=1.5)
     win_30 = get_speech_before(x, sr, pause_start, max_window_s=3.0)
 
     # Frames for windows
+    fr_015 = compute_frames(win_015, sr)
     fr_03 = compute_frames(win_03, sr)
     fr_075 = compute_frames(win_075, sr)
     fr_15 = compute_frames(win_15, sr)
     fr_30 = compute_frames(win_30, sr)
 
-    # ======= 1. Energy Features (11) =======
+    # ======= 1. Energy Features (16) =======
+    e_30 = compute_energy_db(fr_30)
     e_15 = compute_energy_db(fr_15)
     e_075 = compute_energy_db(fr_075)
     e_03 = compute_energy_db(fr_03)
+    e_015 = compute_energy_db(fr_015)
 
     e_last = float(e_03[-1]) if len(e_03) > 0 else -100.0
+    e_mean_015 = float(np.mean(e_015)) if len(e_015) > 0 else -100.0
     e_mean_03 = float(np.mean(e_03))
     e_mean_075 = float(np.mean(e_075))
     e_mean_15 = float(np.mean(e_15))
     e_std_075 = float(np.std(e_075)) if len(e_075) > 1 else 0.0
     e_max_15 = float(np.max(e_15))
     e_drop_ratio = e_last - e_mean_15  # energy drop in dB
+
+    # Fine-grained energy drops
+    e_drop_100_300 = e_mean_015 - e_mean_03
+    e_drop_100_1500 = e_mean_015 - e_mean_15
+
+    # Tail silence duration immediately prior to pause_start (frames < -45 dB)
+    tail_silence_frames = 0
+    for val in reversed(e_03):
+        if val < -45.0:
+            tail_silence_frames += 1
+        else:
+            break
+    e_tail_silence_ms = float(tail_silence_frames * 10.0)
 
     # Energy Slopes
     if len(e_03) >= 3:
@@ -292,7 +330,7 @@ def extract_advanced_features(x, sr, pause_start, pause_index=0):
     else:
         e_slope_075 = 0.0
 
-    # Delta energy: frame-to-frame energy changes in last 300ms
+    # Delta energy
     if len(e_03) > 1:
         delta_e = np.diff(e_03)
         e_delta_mean = float(np.mean(delta_e))
@@ -301,13 +339,15 @@ def extract_advanced_features(x, sr, pause_start, pause_index=0):
         e_delta_mean = 0.0
         e_delta_std = 0.0
 
-    # ======= 2. Pitch / Prosody Features (14) =======
+    # ======= 2. Pitch / Prosody Features (20) =======
     f0_15 = compute_f0_contour(fr_15, sr)
     f0_075 = compute_f0_contour(fr_075, sr)
     f0_30 = compute_f0_contour(fr_30, sr)
+    f0_03 = compute_f0_contour(fr_03, sr)
     voiced_15 = f0_15[f0_15 > 0]
     voiced_075 = f0_075[f0_075 > 0]
     voiced_30 = f0_30[f0_30 > 0]
+    voiced_03 = f0_03[f0_03 > 0]
 
     voiced_ratio_03 = float(np.mean(f0_075[-5:] > 0)) if len(f0_075) >= 5 else 0.0
     voiced_ratio_075 = float(np.mean(f0_075 > 0)) if len(f0_075) > 0 else 0.0
@@ -315,22 +355,40 @@ def extract_advanced_features(x, sr, pause_start, pause_index=0):
 
     if len(voiced_15) > 0:
         f0_mean_15 = float(np.mean(voiced_15))
+        f0_median_15 = float(np.median(voiced_15))
         f0_std_15 = float(np.std(voiced_15)) if len(voiced_15) > 1 else 0.0
         f0_min_15 = float(np.min(voiced_15))
         f0_max_15 = float(np.max(voiced_15))
         f0_range_15 = f0_max_15 - f0_min_15
     else:
-        f0_mean_15, f0_std_15, f0_min_15, f0_max_15, f0_range_15 = 0.0, 0.0, 0.0, 0.0, 0.0
+        f0_mean_15, f0_median_15, f0_std_15, f0_min_15, f0_max_15, f0_range_15 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     if len(voiced_075) >= 2:
         f0_last = float(voiced_075[-1])
         f0_drop_ratio = f0_last / (f0_mean_15 + 1e-6)
+        f0_last_vs_median = f0_last / (f0_median_15 + 1e-6)
         t_voiced = np.arange(len(voiced_075))
         f0_slope_075 = float(np.polyfit(t_voiced, voiced_075, 1)[0])
     else:
         f0_last = 0.0
         f0_drop_ratio = 1.0
+        f0_last_vs_median = 1.0
         f0_slope_075 = 0.0
+
+    # Speaker-Normalized Semitones Pitch: 12 * log2(f0_last / f0_mean_30)
+    f0_mean_30 = float(np.mean(voiced_30)) if len(voiced_30) > 0 else f0_mean_15
+    if f0_last > 0 and f0_mean_30 > 0:
+        st_last = float(12.0 * np.log2(f0_last / f0_mean_30))
+    else:
+        st_last = 0.0
+
+    # Semitones Pitch Rise (Question Intonation Indicator)
+    if len(voiced_03) >= 2 and f0_min_15 > 0:
+        st_min_15 = float(np.min(voiced_15))
+        st_last_03 = float(voiced_03[-1])
+        st_rise_indicator = float(12.0 * np.log2(st_last_03 / (st_min_15 + 1e-6))) if st_last_03 > 0 else 0.0
+    else:
+        st_rise_indicator = 0.0
 
     # Final syllable lengthening
     final_syl_ratio = compute_final_syllable_lengthening(f0_15)
@@ -338,65 +396,81 @@ def extract_advanced_features(x, sr, pause_start, pause_index=0):
     # Speech rate from 1.5s window
     speech_rate_15 = compute_speech_rate(f0_15)
 
+    # Unvoiced gaps
+    unvoiced_gaps_15 = float(compute_unvoiced_gaps(f0_15))
+    unvoiced_gaps_30 = float(compute_unvoiced_gaps(f0_30))
+
     # ======= 3. Zero Crossing Rate (ZCR) Features (4) =======
     zcr_03 = compute_zcr(fr_03)
     zcr_075 = compute_zcr(fr_075)
     zcr_mean_03 = float(np.mean(zcr_03))
     zcr_mean_075 = float(np.mean(zcr_075))
     zcr_last = float(zcr_03[-1]) if len(zcr_03) > 0 else 0.0
-    # ZCR slope
     if len(zcr_03) >= 3:
         zcr_slope = float(np.polyfit(np.arange(len(zcr_03)), zcr_03, 1)[0])
     else:
         zcr_slope = 0.0
 
-    # ======= 4. Spectral Features (8) =======
+    # ======= 4. Spectral Features (10) =======
     sc_mean_03, sroll_mean_03, sflux_03, stilt_03 = compute_spectral_stats(fr_03, sr)
     sc_mean_075, sroll_mean_075, sflux_075, stilt_075 = compute_spectral_stats(fr_075, sr)
+    sc_slope_075 = sc_mean_03 - sc_mean_075
+    stilt_drop = stilt_03 - stilt_075
 
     # ======= 5. Harmonic-to-Noise Ratio (1) =======
     hnr_075 = compute_hnr(fr_075, sr)
 
-    # ======= 6. MFCC Summaries (20) =======
+    # ======= 6. MFCC Summaries & Deltas (22) =======
     mfcc_075 = compute_mfcc_simple(fr_075, sr, n_mfcc=13)
     if len(mfcc_075.shape) > 1 and mfcc_075.shape[0] > 0:
         mfcc_means = np.mean(mfcc_075, axis=0)
         mfcc_stds = np.std(mfcc_075, axis=0) if mfcc_075.shape[0] > 1 else np.zeros(13, dtype=np.float32)
+        if mfcc_075.shape[0] > 1:
+            mfcc_delta = np.diff(mfcc_075, axis=0)
+            mfcc_delta_mean = float(np.mean(np.abs(mfcc_delta)))
+            mfcc_delta_std = float(np.std(mfcc_delta))
+        else:
+            mfcc_delta_mean, mfcc_delta_std = 0.0, 0.0
     else:
         mfcc_means = np.zeros(13, dtype=np.float32)
         mfcc_stds = np.zeros(13, dtype=np.float32)
+        mfcc_delta_mean, mfcc_delta_std = 0.0, 0.0
 
-    # ======= 7. Temporal & Turn Context (4) =======
+    # ======= 7. Temporal & Conversational Context (5) =======
     turn_elapsed = float(pause_start)
     pause_idx = float(pause_index)
-    # Pause position ratio: normalized pause index
     pause_pos_ratio = pause_idx / (pause_idx + 1.0)
-    # Log of turn elapsed (compresses long turns)
     log_turn_elapsed = float(np.log1p(turn_elapsed))
+    voiced_duration_tot = float(len(voiced_30) * 0.01)
+    speech_to_elapsed_ratio = voiced_duration_tot / (turn_elapsed + 1e-3)
 
-    # ======= Assemble feature vector (62 features) =======
+    # ======= Assemble feature vector (78 features) =======
     features = np.hstack([
-        # Energy (11)
-        e_last, e_mean_03, e_mean_075, e_mean_15, e_std_075, e_max_15,
-        e_drop_ratio, e_slope_03, e_slope_075, e_delta_mean, e_delta_std,
-        # Pitch / Prosody (14)
+        # Energy (16)
+        e_last, e_mean_015, e_mean_03, e_mean_075, e_mean_15, e_std_075, e_max_15,
+        e_drop_ratio, e_drop_100_300, e_drop_100_1500, e_tail_silence_ms,
+        e_slope_03, e_slope_075, e_delta_mean, e_delta_std,
+        # Pitch / Prosody (20)
         voiced_ratio_03, voiced_ratio_075, voiced_ratio_15,
-        f0_mean_15, f0_std_15, f0_range_15,
-        f0_last, f0_drop_ratio, f0_slope_075,
-        f0_min_15, f0_max_15,
-        final_syl_ratio, speech_rate_15,
+        f0_mean_15, f0_median_15, f0_std_15, f0_range_15,
+        f0_last, f0_drop_ratio, f0_last_vs_median, f0_slope_075,
+        f0_min_15, f0_max_15, st_last, st_rise_indicator,
+        final_syl_ratio, speech_rate_15, unvoiced_gaps_15, unvoiced_gaps_30,
         hnr_075,
         # ZCR (4)
         zcr_mean_03, zcr_mean_075, zcr_last, zcr_slope,
-        # Spectral (8)
+        # Spectral (10)
         sc_mean_03, sroll_mean_03, sflux_03, stilt_03,
         sc_mean_075, sroll_mean_075, sflux_075, stilt_075,
-        # Context (4)
-        turn_elapsed, pause_idx, pause_pos_ratio, log_turn_elapsed,
+        sc_slope_075, stilt_drop,
+        # Context (5)
+        turn_elapsed, pause_idx, pause_pos_ratio, log_turn_elapsed, speech_to_elapsed_ratio,
         # MFCC Means (10)
         mfcc_means[:10],
         # MFCC Stds (11)
         mfcc_stds[:11],
+        # MFCC Deltas (2)
+        mfcc_delta_mean, mfcc_delta_std,
     ]).astype(np.float32)
 
     return features

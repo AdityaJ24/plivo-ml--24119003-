@@ -20,6 +20,7 @@ from sklearn.ensemble import (
     HistGradientBoostingClassifier,
 )
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -62,31 +63,37 @@ def get_models():
     # 1. Scaled Logistic Regression
     models["LogisticRegression"] = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=2000, class_weight="balanced", C=0.3, random_state=42))
+        ("clf", LogisticRegression(max_iter=2000, class_weight="balanced", C=0.5, random_state=42))
     ])
 
-    # 2. Random Forest
+    # 2. Multi-Layer Perceptron Neural Net (sklearn)
+    models["MLPClassifier"] = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=800, alpha=0.01, random_state=42))
+    ])
+
+    # 3. Random Forest
     models["RandomForest"] = RandomForestClassifier(
-        n_estimators=300, max_depth=8, min_samples_leaf=3,
+        n_estimators=400, max_depth=8, min_samples_leaf=2,
         class_weight="balanced", random_state=42, n_jobs=-1
     )
 
-    # 3. Extra Trees
+    # 4. Extra Trees (tuned)
     models["ExtraTrees"] = ExtraTreesClassifier(
-        n_estimators=300, max_depth=9, min_samples_leaf=2,
+        n_estimators=400, max_depth=10, min_samples_leaf=2,
         class_weight="balanced", random_state=42, n_jobs=-1
     )
 
-    # 4. Gradient Boosting (sklearn — replaces LightGBM)
+    # 5. Gradient Boosting (sklearn)
     models["GradientBoosting"] = GradientBoostingClassifier(
-        n_estimators=200, max_depth=4, learning_rate=0.05,
-        subsample=0.8, min_samples_leaf=5, random_state=42
+        n_estimators=250, max_depth=4, learning_rate=0.04,
+        subsample=0.85, min_samples_leaf=4, random_state=42
     )
 
-    # 5. Histogram Gradient Boosting (sklearn — replaces CatBoost)
+    # 6. Histogram Gradient Boosting (sklearn)
     models["HistGradientBoosting"] = HistGradientBoostingClassifier(
-        max_iter=250, max_depth=5, learning_rate=0.05,
-        min_samples_leaf=5, random_state=42
+        max_iter=300, max_depth=5, learning_rate=0.04,
+        min_samples_leaf=4, l2_regularization=0.1, random_state=42
     )
 
     return models
@@ -118,13 +125,13 @@ def evaluate_cv(X, y, groups, model_name, model, n_splits=5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--en_dir", default="eot_handout/eot_data/english")
-    ap.add_argument("--hi_dir", default="eot_handout/eot_data/hindi")
-    ap.add_argument("--out_model", default="eot_model.joblib")
+    ap.add_argument("--en_dir", default="d:/Plivo/eot_handout/eot_data/english")
+    ap.add_argument("--hi_dir", default="d:/Plivo/eot_handout/eot_data/hindi")
+    ap.add_argument("--out_model", default="d:/Plivo/eot_model.joblib")
     args = ap.parse_args()
 
     print("=" * 70)
-    print("EoT Model Training — scikit-learn ONLY (no LightGBM/CatBoost)")
+    print("EoT Model Training Iteration — 78 Features (scikit-learn ONLY)")
     print("=" * 70)
 
     print("\nLoading and extracting features for English dataset...")
@@ -135,16 +142,14 @@ def main():
     X_hi, y_hi, g_hi, k_hi = load_dataset(args.hi_dir)
     print(f"Hindi: {X_hi.shape[0]} samples, {X_hi.shape[1]} features.")
 
-    # Combine datasets for robust multi-lingual training
+    # Combine datasets
     X_all = np.vstack([X_en, X_hi])
     y_all = np.hstack([y_en, y_hi])
-    # Prefix group IDs with language to avoid collision
     g_all = np.hstack([np.array([f"en_{g}" for g in g_en]), np.array([f"hi_{g}" for g in g_hi])])
 
     print(f"\n--- Combined Dataset: {X_all.shape[0]} samples, {X_all.shape[1]} features, "
           f"{len(np.unique(g_all))} unique turns ---\n")
 
-    # NaN/Inf safety
     X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
 
     candidate_models = get_models()
@@ -155,13 +160,11 @@ def main():
         oof_p = evaluate_cv(X_all, y_all, g_all, name, clf)
         oof_results[name] = oof_p
 
-        # Score EN and HI OOF predictions separately
         p_en = oof_p[:len(y_en)]
         p_hi = oof_p[len(y_en):]
 
         temp_pred_file = f"_temp_oof_{name}.csv"
 
-        # Write EN OOF
         with open(temp_pred_file, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["turn_id", "pause_index", "p_eot"])
@@ -169,7 +172,6 @@ def main():
                 w.writerow([tid, pi, f"{val:.4f}"])
         r_en = score(os.path.join(args.en_dir, "labels.csv"), temp_pred_file)
 
-        # Write HI OOF
         with open(temp_pred_file, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["turn_id", "pause_index", "p_eot"])
@@ -186,11 +188,12 @@ def main():
     # Weighted ensemble from OOF predictions
     print("\n--- Weighted Ensemble (OOF) ---")
     weights = {
-        "HistGradientBoosting": 0.30,
-        "GradientBoosting": 0.25,
-        "ExtraTrees": 0.25,
-        "LogisticRegression": 0.10,
-        "RandomForest": 0.10,
+        "HistGradientBoosting": 0.28,
+        "ExtraTrees": 0.28,
+        "GradientBoosting": 0.24,
+        "MLPClassifier": 0.10,
+        "LogisticRegression": 0.05,
+        "RandomForest": 0.05,
     }
     oof_ens = np.zeros(len(y_all), dtype=np.float64)
     for m_name, w in weights.items():
@@ -229,11 +232,11 @@ def main():
     final_ensemble = VotingClassifier(
         estimators=final_estimators,
         voting="soft",
-        weights=[weights.get(name, 0.2) for name in candidate_models.keys()]
+        weights=[weights.get(name, 0.1) for name in candidate_models.keys()]
     )
     final_ensemble.fit(X_all, y_all)
 
-    # Save trained model artifact
+    # Save to both target locations
     model_payload = {
         "model": final_ensemble,
         "n_features": X_all.shape[1],
@@ -241,37 +244,12 @@ def main():
         "sklearn_only": True,
     }
     joblib.dump(model_payload, args.out_model, compress=3)
-    print(f"\nSuccessfully saved final model artifact to {args.out_model}")
+    if os.path.exists("d:/Plivo/eot_handout/starter"):
+        joblib.dump(model_payload, "d:/Plivo/eot_handout/starter/eot_model.joblib", compress=3)
+    if os.path.exists("d:/Plivo/eot_handout"):
+        joblib.dump(model_payload, "d:/Plivo/eot_handout/eot_model.joblib", compress=3)
 
-    # Print feature importances from ExtraTrees
-    print("\n--- Top 15 Feature Importances (ExtraTrees) ---")
-    et_model = None
-    for name, est in final_ensemble.named_estimators_.items():
-        if 'extra' in name.lower():
-            et_model = est
-            break
-    if et_model is not None and hasattr(et_model, 'feature_importances_'):
-        imp = et_model.feature_importances_
-        feat_names = [
-            "e_last", "e_mean_03", "e_mean_075", "e_mean_15", "e_std_075", "e_max_15",
-            "e_drop_ratio", "e_slope_03", "e_slope_075", "e_delta_mean", "e_delta_std",
-            "voiced_ratio_03", "voiced_ratio_075", "voiced_ratio_15",
-            "f0_mean_15", "f0_std_15", "f0_range_15",
-            "f0_last", "f0_drop_ratio", "f0_slope_075",
-            "f0_min_15", "f0_max_15",
-            "final_syl_ratio", "speech_rate_15",
-            "hnr_075",
-            "zcr_mean_03", "zcr_mean_075", "zcr_last", "zcr_slope",
-            "sc_mean_03", "sroll_mean_03", "sflux_03", "stilt_03",
-            "sc_mean_075", "sroll_mean_075", "sflux_075", "stilt_075",
-            "turn_elapsed", "pause_idx", "pause_pos_ratio", "log_turn_elapsed",
-        ]
-        feat_names += [f"mfcc_mean_{i}" for i in range(10)]
-        feat_names += [f"mfcc_std_{i}" for i in range(11)]
-        top_idx = np.argsort(imp)[::-1][:15]
-        for rank, i in enumerate(top_idx):
-            fname = feat_names[i] if i < len(feat_names) else f"f_{i}"
-            print(f"  {rank+1:2d}. {fname:20s} = {imp[i]:.4f}")
+    print(f"\nSuccessfully saved final model artifact to {args.out_model}")
 
 
 if __name__ == "__main__":
